@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:variedadesjm/modules/backup/boundary/widgets/backup_loading_overlay.dart';
 import 'package:variedadesjm/modules/backup/controller/backup_providers.dart';
 import 'package:variedadesjm/modules/backup/service/backup_models.dart';
 
@@ -19,14 +20,17 @@ class _AdministrationBackupSheetState
   List<BackupEntry> _backups = [];
   bool _loading = true;
 
+  /// Mensaje de la capa de carga mientras se elimina una copia (null = sin operación).
+  String? _busyMessage;
+
   @override
   void initState() {
     super.initState();
     _load();
   }
 
-  Future<void> _load() async {
-    setState(() => _loading = true);
+  Future<void> _load({bool showSpinner = true}) async {
+    if (showSpinner) setState(() => _loading = true);
     try {
       final service = await ref.read(backupServiceProvider.future);
       final list = await service.listBackups(folderUri: widget.folderUri);
@@ -80,47 +84,47 @@ class _AdministrationBackupSheetState
         ),
       );
 
+  /// Elimina una copia mostrando una capa de carga; al terminar recarga la lista.
   Future<void> _eliminar(BackupEntry entry) async {
+    if (await _confirmar() != true || !mounted) return;
+    setState(() => _busyMessage = 'Eliminando la copia de seguridad...');
+    String? error;
     try {
       final service = await ref.read(backupServiceProvider.future);
       await service.deleteBackup(entry.fileId);
-      if (!mounted) return;
-      _aviso('Copia eliminada', 'La copia de seguridad fue borrada.',
-          Icons.check_circle_outline, Theme.of(context).colorScheme.primary);
     } catch (e) {
-      if (!mounted) return;
-      _aviso('Error', 'No se pudo eliminar: $e', Icons.error_outline,
-          Theme.of(context).colorScheme.error);
-      _load();
+      error = '$e';
     }
-  }
-
-  Future<void> _eliminarManual(BackupEntry entry) async {
-    if (await _confirmar() != true || !mounted) return;
-    setState(() => _backups.removeWhere((e) => e.fileId == entry.fileId));
-    await _eliminar(entry);
+    if (!mounted) return;
+    await _load(showSpinner: false);
+    if (!mounted) return;
+    setState(() => _busyMessage = null);
+    final scheme = Theme.of(context).colorScheme;
+    if (error == null) {
+      _aviso('Copia eliminada', 'La copia de seguridad fue borrada.',
+          Icons.check_circle_outline, scheme.primary);
+    } else {
+      _aviso('Error', 'No se pudo eliminar: $error', Icons.error_outline, scheme.error);
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    return Container(
-      padding: const EdgeInsets.symmetric(vertical: 16),
-      decoration: BoxDecoration(
-        color: Theme.of(context).scaffoldBackgroundColor,
-        borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
-      ),
-      child: Column(
+    // El tema ya dibuja la barra de arrastre de la hoja: aquí no se dibuja otra.
+    return PopScope(
+      canPop: _busyMessage == null,
+      child: Stack(
         children: [
-          Container(
-            width: 40,
-            height: 4,
-            margin: const EdgeInsets.only(bottom: 16),
+          Positioned.fill(
+            child: Container(
+            padding: const EdgeInsets.only(bottom: 16),
             decoration: BoxDecoration(
-              color: scheme.onSurfaceVariant.withValues(alpha: .4),
-              borderRadius: BorderRadius.circular(2),
+              color: Theme.of(context).scaffoldBackgroundColor,
+              borderRadius: const BorderRadius.vertical(top: Radius.circular(28)),
             ),
-          ),
+            child: Column(
+              children: [
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 24),
             child: Row(
@@ -169,11 +173,11 @@ class _AdministrationBackupSheetState
                               padding: const EdgeInsets.only(right: 24),
                               child: Icon(Icons.delete_outline, color: scheme.onError),
                             ),
-                            confirmDismiss: (_) => _confirmar(),
-                            onDismissed: (_) {
-                              setState(() =>
-                                  _backups.removeWhere((e) => e.fileId == entry.fileId));
-                              _eliminar(entry);
+                            // Se confirma y se elimina con capa de carga; la fila
+                            // desaparece al recargar la lista, no antes.
+                            confirmDismiss: (_) async {
+                              await _eliminar(entry);
+                              return false;
                             },
                             child: ListTile(
                               contentPadding:
@@ -203,13 +207,18 @@ class _AdministrationBackupSheetState
                                   : IconButton(
                                       icon: Icon(Icons.delete_outline, color: scheme.error),
                                       tooltip: 'Eliminar copia',
-                                      onPressed: () => _eliminarManual(entry),
+                                      onPressed: () => _eliminar(entry),
                                     ),
                             ),
                           );
                         },
                       ),
           ),
+              ],
+            ),
+          ),
+          ),
+          if (_busyMessage != null) BackupLoadingOverlay(message: _busyMessage!),
         ],
       ),
     );
