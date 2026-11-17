@@ -4,13 +4,20 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:variedadesjm/controllers/database/sembast_stores.dart';
 import 'package:variedadesjm/controllers/providers/sembast_core_providers.dart';
 import 'package:variedadesjm/modules/gasto/entity/gasto.dart';
+import 'package:variedadesjm/modules/gasto/service/gasto_conceptos.dart';
 import 'package:variedadesjm/shared/data/app_data_provider.dart';
 import 'package:variedadesjm/shared/data/app_record_writer.dart';
 import 'package:variedadesjm/shared/layouts/app_layout.dart';
 import 'package:variedadesjm/shared/themes/colors.dart';
 import 'package:variedadesjm/shared/utils/format.dart';
+import 'package:variedadesjm/shared/widgets/pagination/app_pagination.dart';
 
 enum _Period { hoy, mes, todos }
+
+const _pageSize = 10;
+
+/// Cuántos conceptos se muestran como atajos antes de "Ver todos".
+const _conceptosVisibles = 8;
 
 /// Registra gastos con atajos frecuentes y muestra el historial por período.
 class GastoPage extends ConsumerStatefulWidget {
@@ -31,15 +38,47 @@ class _GastoPageState extends ConsumerState<GastoPage> {
   final _description = TextEditingController();
   final _amount = TextEditingController();
   final _descriptionFocus = FocusNode();
+  final _amountFocus = FocusNode();
   String _payment = 'Efectivo';
   _Period _period = _Period.hoy;
   bool _saving = false;
+  int _page = 1;
+
+  // Los conceptos solo se recalculan cuando cambia la lista de gastos.
+  List<Gasto>? _gastosCache;
+  List<ConceptoGasto> _conceptosCache = const [];
+
+  List<ConceptoGasto> _conceptos(List<Gasto> gastos) {
+    if (!identical(gastos, _gastosCache)) {
+      _gastosCache = gastos;
+      _conceptosCache = conceptosDe(gastos);
+    }
+    return _conceptosCache;
+  }
+
+  /// Rellena el concepto y deja el cursor en el monto para escribir solo la cantidad.
+  void _usarConcepto(String nombre) {
+    setState(() => _description.text = nombre);
+    FocusScope.of(context).requestFocus(_amountFocus);
+  }
+
+  /// Hoja con todos los conceptos y un buscador, para elegir uno.
+  Future<void> _verTodosLosConceptos(List<ConceptoGasto> conceptos) async {
+    final elegido = await showModalBottomSheet<ConceptoGasto>(
+      context: context,
+      isScrollControlled: true,
+      useSafeArea: true,
+      builder: (_) => _ConceptosSheet(conceptos: conceptos),
+    );
+    if (elegido != null) _usarConcepto(elegido.nombre);
+  }
 
   @override
   void dispose() {
     _description.dispose();
     _amount.dispose();
     _descriptionFocus.dispose();
+    _amountFocus.dispose();
     super.dispose();
   }
 
@@ -48,9 +87,12 @@ class _GastoPageState extends ConsumerState<GastoPage> {
     setState(() => _saving = true);
     try {
       final database = await ref.read(sembastDatabaseProvider.future);
+      // Si el concepto ya existe (aunque cambien mayúsculas o acentos) se usa su escritura.
+      final existente = conceptoExistente(
+          _description.text, _conceptos(ref.read(gastosProvider).valueOrNull ?? const []));
       final gasto = Gasto(
         id: DateTime.now().microsecondsSinceEpoch.toString(),
-        descripcion: _description.text.trim(),
+        descripcion: existente?.nombre ?? _description.text.trim().replaceAll(RegExp(r'\s+'), ' '),
         monto: double.parse(_amount.text.trim().replaceAll(',', '.')),
         fechaGasto: DateTime.now(),
         idCategoriaGasto: 'general',
@@ -67,6 +109,7 @@ class _GastoPageState extends ConsumerState<GastoPage> {
         ..invalidate(dashboardDataProvider);
       _description.clear();
       _amount.clear();
+      _page = 1;
       if (mounted) {
         FocusScope.of(context).unfocus();
         ScaffoldMessenger.of(context)
@@ -163,6 +206,7 @@ class _GastoPageState extends ConsumerState<GastoPage> {
               ),
             ],
           ),
+          ..._seccionConceptos(context, state.valueOrNull ?? const []),
           const SizedBox(height: 16),
           Card(
             child: Padding(
@@ -192,6 +236,7 @@ class _GastoPageState extends ConsumerState<GastoPage> {
                             focusNode: _descriptionFocus,
                             textCapitalization: TextCapitalization.sentences,
                             decoration: const InputDecoration(labelText: 'Concepto'),
+                            onChanged: (_) => setState(() {}),
                             validator: (value) => value == null || value.trim().isEmpty
                                 ? 'Ingresa un concepto'
                                 : null,
@@ -202,8 +247,13 @@ class _GastoPageState extends ConsumerState<GastoPage> {
                           flex: 3,
                           child: TextFormField(
                             controller: _amount,
+                            focusNode: _amountFocus,
                             keyboardType: const TextInputType.numberWithOptions(decimal: true),
-                            decoration: const InputDecoration(labelText: 'Monto', prefixText: '\$ '),
+                            decoration: InputDecoration(
+                              labelText: 'Monto',
+                              prefixText: '\$ ',
+                              helperText: _ultimoMontoTexto(state.valueOrNull ?? const []),
+                            ),
                             validator: (value) {
                               final amount = double.tryParse((value ?? '').replaceAll(',', '.'));
                               return amount == null || amount <= 0 ? 'Monto inválido' : null;
@@ -212,6 +262,7 @@ class _GastoPageState extends ConsumerState<GastoPage> {
                         ),
                       ],
                     ),
+                    ..._sugerencias(state.valueOrNull ?? const []),
                     const SizedBox(height: 10),
                     Wrap(
                       spacing: 8,
@@ -242,17 +293,26 @@ class _GastoPageState extends ConsumerState<GastoPage> {
               ChoiceChip(
                 label: const Text('Hoy'),
                 selected: _period == _Period.hoy,
-                onSelected: (_) => setState(() => _period = _Period.hoy),
+                onSelected: (_) => setState(() {
+                  _period = _Period.hoy;
+                  _page = 1;
+                }),
               ),
               ChoiceChip(
                 label: const Text('Este mes'),
                 selected: _period == _Period.mes,
-                onSelected: (_) => setState(() => _period = _Period.mes),
+                onSelected: (_) => setState(() {
+                  _period = _Period.mes;
+                  _page = 1;
+                }),
               ),
               ChoiceChip(
                 label: const Text('Todos'),
                 selected: _period == _Period.todos,
-                onSelected: (_) => setState(() => _period = _Period.todos),
+                onSelected: (_) => setState(() {
+                  _period = _Period.todos;
+                  _page = 1;
+                }),
               ),
             ],
           ),
@@ -267,6 +327,10 @@ class _GastoPageState extends ConsumerState<GastoPage> {
               final gastos = all.where((g) => _inPeriod(g.fechaGasto)).toList()
                 ..sort((a, b) => b.fechaGasto.compareTo(a.fechaGasto));
               final total = gastos.fold<double>(0, (sum, g) => sum + g.monto);
+              // Solo se dibujan los 10 gastos de la página actual.
+              final pages = gastos.isEmpty ? 1 : (gastos.length / _pageSize).ceil();
+              final page = _page > pages ? pages : _page;
+              final visibles = gastos.skip((page - 1) * _pageSize).take(_pageSize).toList();
               return Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
@@ -296,7 +360,7 @@ class _GastoPageState extends ConsumerState<GastoPage> {
                           )
                         : Column(
                             children: [
-                              for (var i = 0; i < gastos.length; i++) ...[
+                              for (var i = 0; i < visibles.length; i++) ...[
                                 if (i > 0) const Divider(height: 1),
                                 ListTile(
                                   dense: true,
@@ -306,13 +370,13 @@ class _GastoPageState extends ConsumerState<GastoPage> {
                                     foregroundColor: AppColors.danger,
                                     child: const Icon(Icons.receipt_long_outlined, size: 17),
                                   ),
-                                  title: Text(gastos[i].descripcion),
+                                  title: Text(visibles[i].descripcion),
                                   subtitle: Text(
-                                      '${shortDate(gastos[i].fechaGasto)} · ${gastos[i].metodoPago}'),
+                                      '${shortDate(visibles[i].fechaGasto)} · ${visibles[i].metodoPago}'),
                                   trailing: Row(
                                     mainAxisSize: MainAxisSize.min,
                                     children: [
-                                      Text('-${money(gastos[i].monto)}',
+                                      Text('-${money(visibles[i].monto)}',
                                           style: const TextStyle(
                                               color: AppColors.danger,
                                               fontWeight: FontWeight.w800)),
@@ -320,7 +384,7 @@ class _GastoPageState extends ConsumerState<GastoPage> {
                                         tooltip: 'Eliminar',
                                         visualDensity: VisualDensity.compact,
                                         icon: const Icon(Icons.delete_outline, size: 20),
-                                        onPressed: () => _delete(gastos[i].id),
+                                        onPressed: () => _delete(visibles[i].id),
                                       ),
                                     ],
                                   ),
@@ -329,11 +393,150 @@ class _GastoPageState extends ConsumerState<GastoPage> {
                             ],
                           ),
                   ),
+                  if (gastos.isNotEmpty) ...[
+                    const SizedBox(height: 12),
+                    Center(
+                      child: AppPagination(
+                        currentPage: page,
+                        totalItems: gastos.length,
+                        pageSize: _pageSize,
+                        itemName: 'gastos',
+                        onPageChanged: (value) => setState(() => _page = value),
+                      ),
+                    ),
+                  ],
                 ],
               );
             },
           ),
         ],
+      ),
+    );
+  }
+
+  /// Texto de ayuda bajo el monto: cuánto costó la última vez este concepto.
+  String? _ultimoMontoTexto(List<Gasto> gastos) {
+    final concepto = conceptoExistente(_description.text, _conceptos(gastos));
+    return concepto == null ? null : 'Última vez: ${money(concepto.ultimoMonto)}';
+  }
+
+  /// Sugerencias mientras se escribe, para no repetir un concepto ya creado.
+  List<Widget> _sugerencias(List<Gasto> gastos) {
+    final sugeridos = sugerenciasDe(_description.text, _conceptos(gastos));
+    if (sugeridos.isEmpty) return const [];
+    return [
+      const SizedBox(height: 8),
+      Wrap(
+        spacing: 8,
+        runSpacing: 4,
+        children: [
+          for (final c in sugeridos)
+            ActionChip(
+              avatar: const Icon(Icons.history_rounded, size: 16),
+              label: Text(c.nombre),
+              onPressed: () => _usarConcepto(c.nombre),
+            ),
+        ],
+      ),
+    ];
+  }
+
+  /// Atajos con los conceptos que ya usaste (los más frecuentes primero).
+  List<Widget> _seccionConceptos(BuildContext context, List<Gasto> gastos) {
+    final conceptos = _conceptos(gastos);
+    if (conceptos.isEmpty) return const [];
+    final visibles = conceptos.take(_conceptosVisibles).toList();
+    return [
+      const SizedBox(height: 16),
+      Row(
+        children: [
+          const Expanded(
+            child: Text('Tus conceptos',
+                style: TextStyle(fontSize: 15, fontWeight: FontWeight.w800)),
+          ),
+          if (conceptos.length > _conceptosVisibles)
+            TextButton(
+              onPressed: () => _verTodosLosConceptos(conceptos),
+              child: Text('Ver todos (${conceptos.length})'),
+            ),
+        ],
+      ),
+      Text('Elige uno y solo escribe el monto', style: Theme.of(context).textTheme.bodySmall),
+      const SizedBox(height: 8),
+      Wrap(
+        spacing: 8,
+        runSpacing: 6,
+        children: [
+          for (final c in visibles)
+            ActionChip(
+              label: Text(c.nombre),
+              onPressed: () => _usarConcepto(c.nombre),
+            ),
+        ],
+      ),
+    ];
+  }
+}
+
+/// Hoja con todos los conceptos, con buscador.
+class _ConceptosSheet extends StatefulWidget {
+  final List<ConceptoGasto> conceptos;
+
+  const _ConceptosSheet({required this.conceptos});
+
+  @override
+  State<_ConceptosSheet> createState() => _ConceptosSheetState();
+}
+
+class _ConceptosSheetState extends State<_ConceptosSheet> {
+  String _query = '';
+
+  @override
+  Widget build(BuildContext context) {
+    final clave = claveConcepto(_query);
+    final lista = [
+      for (final c in widget.conceptos)
+        if (clave.isEmpty || claveConcepto(c.nombre).contains(clave)) c,
+    ];
+    return Padding(
+      padding: EdgeInsets.only(bottom: MediaQuery.of(context).viewInsets.bottom),
+      child: SizedBox(
+        height: MediaQuery.of(context).size.height * 0.7,
+        child: Column(
+          children: [
+            Padding(
+              padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text('Tus conceptos',
+                      style: TextStyle(fontSize: 18, fontWeight: FontWeight.w800)),
+                  const SizedBox(height: 10),
+                  TextField(
+                    onChanged: (v) => setState(() => _query = v),
+                    decoration: const InputDecoration(
+                      hintText: 'Buscar...',
+                      prefixIcon: Icon(Icons.search_rounded),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            Expanded(
+              child: lista.isEmpty
+                  ? const Center(child: Text('Nada coincide con tu búsqueda.'))
+                  : ListView.builder(
+                      itemCount: lista.length,
+                      itemBuilder: (context, i) => ListTile(
+                        title: Text(lista[i].nombre),
+                        subtitle: Text(
+                            '${lista[i].veces} ${lista[i].veces == 1 ? 'gasto' : 'gastos'} · última vez ${money(lista[i].ultimoMonto)}'),
+                        onTap: () => Navigator.pop(context, lista[i]),
+                      ),
+                    ),
+            ),
+          ],
+        ),
       ),
     );
   }

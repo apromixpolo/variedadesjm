@@ -5,6 +5,7 @@ import 'package:saf_util/saf_util.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:variedadesjm/controllers/providers/sembast_core_providers.dart';
 import 'package:variedadesjm/modules/backup/boundary/widgets/administration_backup_sheet.dart';
+import 'package:variedadesjm/modules/backup/boundary/widgets/backup_loading_overlay.dart';
 import 'package:variedadesjm/modules/backup/boundary/widgets/backup_tutorial_dialog.dart';
 import 'package:variedadesjm/modules/backup/controller/backup_providers.dart';
 import 'package:variedadesjm/modules/backup/service/backup_models.dart';
@@ -122,7 +123,7 @@ class _BackupPageState extends ConsumerState<BackupPage> {
 
     setState(() {
       _working = true;
-      _status = 'Generando copia de seguridad...';
+      _status = 'Creando la copia de seguridad...\nGuardando datos y fotos';
     });
     try {
       final service = await ref.read(backupServiceProvider.future);
@@ -358,7 +359,10 @@ class _BackupPageState extends ConsumerState<BackupPage> {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    return Scaffold(
+    // Mientras hay una operación en curso no se puede salir de la pantalla.
+    return PopScope(
+      canPop: !_working,
+      child: Scaffold(
       appBar: AppBar(
         title: const Text('Copias de seguridad'),
         actions: [
@@ -369,7 +373,9 @@ class _BackupPageState extends ConsumerState<BackupPage> {
           ),
         ],
       ),
-      body: ListView(
+      body: Stack(
+        children: [
+      ListView(
         padding: const EdgeInsets.all(16),
         children: [
           Card(
@@ -395,18 +401,6 @@ class _BackupPageState extends ConsumerState<BackupPage> {
             ),
           ),
           const SizedBox(height: 16),
-          if (_working)
-            Padding(
-              padding: const EdgeInsets.symmetric(vertical: 16),
-              child: Column(
-                children: [
-                  const CircularProgressIndicator(),
-                  const SizedBox(height: 12),
-                  Text(_status ?? 'Procesando...',
-                      style: const TextStyle(fontStyle: FontStyle.italic)),
-                ],
-              ),
-            ),
           _Accion(
             icon: Icons.cloud_upload_outlined,
             titulo: 'Hacer copia de seguridad',
@@ -432,6 +426,10 @@ class _BackupPageState extends ConsumerState<BackupPage> {
             onTap: _working ? null : _limpiarFotos,
           ),
         ],
+      ),
+          if (_working) BackupLoadingOverlay(message: _status ?? 'Procesando...'),
+        ],
+      ),
       ),
     );
   }
